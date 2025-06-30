@@ -4,7 +4,6 @@
 #
 # This script monitors processes by checking their status in a MySQL database
 # and restarts them when they are in alarm state.
-# Designed for RedHat Linux environments.
 
 # Set up logging
 LOG_FILE="/var/log/monitor_service.log"
@@ -15,7 +14,13 @@ CONFIG_FILE="config.ini"
 # Temporary MySQL config file
 MYSQL_TEMP_CONFIG=$(mktemp)
 
-# Function to create MySQL config file
+###############################################################################
+# Function: create_mysql_config
+# Purpose:  Create a temporary MySQL client config file with credentials.
+#           This avoids passing credentials on the command line.
+#           Function to create MySQL config file.
+###############################################################################
+
 create_mysql_config() {
     # Ensure the temp file exists and is empty
     > "$MYSQL_TEMP_CONFIG"
@@ -33,7 +38,13 @@ database=$DB_NAME
 EOF
 }
 
-# Function to clean up temporary MySQL config file
+###############################################################################
+# Function: cleanup_mysql_config
+# Purpose:  Remove the temporary MySQL config file on script exit.
+#           This ensures sensitive information is not left on disk.
+#           Function to clean up MySQL config file.
+###############################################################################
+
 cleanup_mysql_config() {
     if [ -f "$MYSQL_TEMP_CONFIG" ]; then
         rm -f "$MYSQL_TEMP_CONFIG"
@@ -43,7 +54,12 @@ cleanup_mysql_config() {
 # Set up trap to clean up on exit
 trap cleanup_mysql_config EXIT
 
-# Function to check if log rotation is needed
+###############################################################################
+# Function: check_log_rotation
+# Purpose:  Determine if the log file exceeds the configured size and needs rotation.
+# Returns:  0 if rotation needed, 1 otherwise.
+###############################################################################
+
 check_log_rotation() {
     # If log file doesn't exist, no rotation needed
     if [ ! -f "$LOG_FILE" ]; then
@@ -53,6 +69,12 @@ check_log_rotation() {
     # Get file size in KB
     local file_size=$(du -k "$LOG_FILE" | cut -f1)
 
+    # Guard: Ensure MAX_LOG_SIZE is set and numeric
+    if [ -z "$MAX_LOG_SIZE" ] || ! [[ "$MAX_LOG_SIZE" =~ ^[0-9]+$ ]]; then
+        echo "ERROR: MAX_LOG_SIZE is not set or not a valid integer (value: '$MAX_LOG_SIZE')" >&2
+        return 1
+    fi
+
     # Check if file size exceeds the maximum
     if [ "$file_size" -ge "$MAX_LOG_SIZE" ]; then
         return 0  # Rotation needed
@@ -61,7 +83,11 @@ check_log_rotation() {
     fi
 }
 
-# Function to rotate log files
+###############################################################################
+# Function: rotate_logs
+# Purpose:  Rotate log files, keeping only the configured number of backups.
+###############################################################################
+
 rotate_logs() {
     # If log file doesn't exist, nothing to rotate
     if [ ! -f "$LOG_FILE" ]; then
@@ -94,6 +120,11 @@ rotate_logs() {
     echo "$timestamp - INFO - Log file rotated, previous log saved as ${LOG_FILE}.1" >> "$LOG_FILE"
 }
 
+###############################################################################
+# Function: log
+# Purpose:  Write a timestamped log message, rotating logs if needed.
+###############################################################################
+
 log() {
     local level="$1"
     local message="$2"
@@ -104,10 +135,22 @@ log() {
         rotate_logs
     fi
 
-    echo "$timestamp - $level - $message" | tee -a "$LOG_FILE"
+    # Format: YYYY-MM-DD HH:MM:SS [LEVEL] - Message
+    echo "$timestamp  [$level] - $message" | tee -a "$LOG_FILE"
+    
+    # If level is ERROR or higher, also log to syslog
+    if [[ "$level" == "ERROR" || "$level" == "CRITICAL" ]]; then
+        logger -p daemon.err "$timestamp [$level] $message"
+    fi
 }
 
-# Read configuration from config.ini
+###############################################################################
+# Function: read_config
+# Purpose:  Read configuration from config.ini
+#           Parse the config.ini file and export required variables.
+#           Validates presence and numeric type for critical settings.
+###############################################################################
+
 read_config() {
     if [ ! -f "$CONFIG_FILE" ]; then
         log "ERROR" "Configuration file $CONFIG_FILE not found"
@@ -165,10 +208,21 @@ read_config() {
     fi
 }
 
-# Get processes in alarm state
+###############################################################################
+# Function: get_alarm_processes
+# Purpose:  Query the database for processes in alarm state (alarma=1, sound=0)
+#           Get processes in alarm state
+# Output:   Each line: process_id|process_name|alarma|sound|notes
+###############################################################################
+
 get_alarm_processes() {
     # Use --defaults-file instead of passing credentials on command line
-    mysql --defaults-file="$MYSQL_TEMP_CONFIG" -N <<EOF
+    # Added options to optimize connection handling:
+    # --connect-timeout=5: Limit connection time to 5 seconds
+    # --quick: Reduce memory usage and speed up query execution
+    # --compress: Reduce network traffic
+    # --reconnect=FALSE: Prevent automatic reconnection attempts
+    mysql --defaults-file="$MYSQL_TEMP_CONFIG" --connect-timeout=5 --quick --compression-algorithms=zlib,uncompressed --reconnect=FALSE -N <<EOF
     SELECT CONCAT(p.process_id, '|', p.process_name, '|', s.alarma, '|', s.sound, '|', s.notes)
     FROM STATUS_PROCESS s
     JOIN PROCESE p ON s.process_id = p.process_id
@@ -176,7 +230,17 @@ get_alarm_processes() {
 EOF
 }
 
-# Get process-specific configuration
+###############################################################################
+# Function: get_process_config
+# Purpose:  Retrieve a process-specific configuration value, falling back to
+#           [process.default] or a provided default if not found.
+#           Get process-specific configuration
+# Arguments:
+#   $1 - process name
+#   $2 - parameter name
+#   $3 - default value (optional)
+###############################################################################
+
 get_process_config() {
     local process_name="$1"
     local param="$2"
@@ -194,7 +258,13 @@ get_process_config() {
     echo "${value:-$default_value}"
 }
 
-# Execute pre-restart command if configured
+
+###############################################################################
+# Function: execute_pre_restart
+# Purpose:  Run a pre-restart command for a process if configured.
+# Returns:  0 on success, 1 on failure.
+###############################################################################
+
 execute_pre_restart() {
     local process_name="$1"
     local pre_command=$(get_process_config "$process_name" "pre_restart_command" "")
@@ -209,7 +279,13 @@ execute_pre_restart() {
     return 0
 }
 
-# Perform health check after restart
+###############################################################################
+# Function: perform_health_check
+# Purpose:  Run a health check command for a process, retrying until timeout.
+#           Perform health check after restart
+# Returns:  0 if health check passes, 1 if it fails after timeout.
+###############################################################################
+
 perform_health_check() {
     local process_name="$1"
     local health_command=$(get_process_config "$process_name" "health_check_command" "")
@@ -239,8 +315,9 @@ perform_health_check() {
             break
         fi
 
-        local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-        printf "\r%s - DEBUG - Health check attempt failed for %s, retrying in 1 second... (attempt %d)" "$timestamp" "$process_name" "$attempt"
+        # Print progress for user, but not to logs
+        # Use a format that won't be captured by system logs and shows actual seconds
+        printf "\rHealth check attempt failed for %s, retrying in 1 second... (attempt %d)" "$process_name" "$attempt"
         sleep 1
         current_time=$(date +%s)
         attempt=$((attempt + 1))
@@ -256,14 +333,25 @@ perform_health_check() {
     fi
 }
 
-# Get restart strategy for a process
+###############################################################################
+# Function: get_restart_strategy
+# Purpose:  Get the restart strategy for a process (service, process, custom, auto).
+###############################################################################
+
 get_restart_strategy() {
     local process_name="$1"
     local strategy=$(get_process_config "$process_name" "restart_strategy" "auto")
     echo "$strategy"
 }
 
-# Restart a process or service
+###############################################################################
+# Function: restart_process
+# Purpose:  Attempt to restart a process using its configured strategy.
+#           Handles service, process, custom, and auto strategies.
+#           Retries up to max_attempts with delay.
+# Returns:  0 on success, 1 on failure.
+###############################################################################
+
 restart_process() {
     local process_name="$1"
     local strategy=$(get_restart_strategy "$process_name")
@@ -297,7 +385,7 @@ restart_process() {
                 ;;
 
             "process")
-                # Direct process management
+                # Direct process management : kill and restart
                 if pkill "$process_name"; then
                     log "INFO" "RESTART LOG: Successfully killed process: $process_name"
                     sleep "$restart_delay"
@@ -311,6 +399,36 @@ restart_process() {
                             log "ERROR" "RESTART LOG: Process start command succeeded but health check failed for: $process_name"
                         fi
                     fi
+                fi
+                ;;
+
+            "custom")
+                # Get custom restart command
+                local restart_command=$(get_process_config "$process_name" "restart_command" "")
+
+                # Check if restart command is configured
+                if [ -z "$restart_command" ]; then
+                    log "ERROR" "RESTART LOG: No restart command configured for $process_name with custom strategy"
+                    return 1
+                fi
+
+                # Replace %s with process name if present in the command
+                restart_command=$(echo "$restart_command" | sed "s/%s/$process_name/g")
+
+                log "INFO" "RESTART LOG: Executing custom restart command for $process_name: $restart_command"
+
+                # Execute custom restart command
+                if eval "$restart_command" >/dev/null 2>&1; then
+                    log "INFO" "RESTART LOG: Custom restart command executed for: $process_name"
+                    # Perform health check after restart
+                    if perform_health_check "$process_name"; then
+                        log "INFO" "RESTART LOG: Successfully restarted and verified process: $process_name"
+                        return 0
+                    else
+                        log "ERROR" "RESTART LOG: Custom restart command succeeded but health check failed for: $process_name"
+                    fi
+                else
+                    log "ERROR" "RESTART LOG: Custom restart command failed for: $process_name"
                 fi
                 ;;
 
@@ -358,9 +476,15 @@ restart_process() {
 update_alarm_status() {
     local process_id="$1"
     local current_time=$(date '+%Y-%m-%d %H:%M:%S')
-
+    
+    # TO DO: FUNCTION WILL BE LATER DELETED, it's used only for testing purposes. The new user will have only SELECT permissions.
     # Use --defaults-file instead of passing credentials on command line
-    mysql --defaults-file="$MYSQL_TEMP_CONFIG" <<EOF
+    # Added options to optimize connection handling:
+    # --connect-timeout=5: Limit connection time to 5 seconds
+    # --quick: Reduce memory usage and speed up query execution
+    # --compress: Reduce network traffic
+    # --reconnect=FALSE: Prevent automatic reconnection attempts
+    mysql --defaults-file="$MYSQL_TEMP_CONFIG" --connect-timeout=5 --quick --compression-algorithms=zlib,uncompressed --reconnect=FALSE <<EOF
     UPDATE STATUS_PROCESS 
     SET alarma = 0, notes = CONCAT(notes, ' - Restarted at $current_time')
     WHERE process_id = $process_id;
@@ -375,10 +499,22 @@ EOF
     fi
 }
 
-# Circuit breaker implementation
+###############################################################################
+# Circuit Breaker Pattern
+# Purpose:  Prevents repeated restart attempts for failing processes.
+#           Opens circuit after N failures, resets after a cooldown.
+###############################################################################
+
 declare -A circuit_breaker
 declare -A failure_counts
 declare -A last_failure_times
+
+###############################################################################
+# Function: check_circuit_breaker
+# Purpose:  Check if the circuit breaker is open for a process.
+#           If open, skip restart until reset time has elapsed.
+# Returns:  0 if closed, 1 if open.
+###############################################################################
 
 check_circuit_breaker() {
     local process_name="$1"
@@ -396,9 +532,8 @@ check_circuit_breaker() {
         local time_diff=$((current_time - ${last_failure_times[$process_name]}))
         local time_remaining=$((CIRCUIT_RESET_TIME - time_diff))
 
-        # Print initial circuit breaker status
-        timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-        printf "%s - DEBUG - Circuit breaker status for %s: Time remaining until reset: %s seconds\r" "$timestamp" "$process_name" "$time_remaining"
+        # Print initial circuit breaker status without logging to system logs
+        printf "Circuit breaker status for %s: Time remaining until reset: %s seconds\r" "$process_name" "$time_remaining"
 
         if [ $time_diff -ge "$CIRCUIT_RESET_TIME" ]; then
             echo "" # New line before the next message
@@ -416,6 +551,11 @@ check_circuit_breaker() {
     return 0
 }
 
+###############################################################################
+# Function: update_circuit_breaker
+# Purpose:  Update the circuit breaker state after a restart attempt.
+#           Opens the circuit if failures exceed threshold.
+###############################################################################
 update_circuit_breaker() {
     local process_name="$1"
     local success="$2"
@@ -430,26 +570,34 @@ update_circuit_breaker() {
             log "WARNING" "Circuit breaker opened for $process_name after ${failure_counts[$process_name]} failures"
         fi
     else
+        # Reset failure count on success
         failure_counts[$process_name]=0
+        log "INFO" "Reset failure count for process: $process_name after successful restart"
     fi
 }
 
+###############################################################################
+# Function: main
+# Purpose:  Main monitoring loop. Checks for alarmed processes, attempts restarts,
+#           updates database and circuit breaker state, and waits for next interval.
+###############################################################################
 # Main monitoring loop
 main() {
-    log "INFO" "Starting Process Monitor Service"
-
-    # Read configuration
+    # Read configuration first
     read_config
 
     # Create MySQL config file with the loaded credentials
     create_mysql_config
 
+    log "INFO" "Starting Process Monitor Service"
+    
     while true; do
         start_time=$(date +%s)
 
         # Get processes in alarm state
         while IFS='|' read -r process_id process_name alarma sound notes; do
             if [ -n "$process_id" ]; then
+                echo " " # Print a space to avoid overwriting the previous line
                 log "INFO" "Found process in alarm: $process_name (ID: $process_id)"
 
                 # Check circuit breaker
@@ -469,12 +617,12 @@ main() {
 
         # Calculate and show countdown until next check
         time_until_next_check=$CHECK_INTERVAL
-        timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-        printf "%s - DEBUG - Next database check in %s seconds\r" "$timestamp" "$time_until_next_check"
+        # Use a format that won't be captured by system logs
+        printf "Next database check in %s seconds\r" "$time_until_next_check"
         while [ $time_until_next_check -gt 0 ]; do
             sleep 1
             time_until_next_check=$((time_until_next_check - 1))
-            printf "\033[2K\r%s - DEBUG - Next database check in %s seconds\r" "$timestamp" "$time_until_next_check"
+            printf "\033[2K\rNext database check in %s seconds\r" "$time_until_next_check"
         done
         echo "" # New line after countdown finishes
     done

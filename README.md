@@ -2,6 +2,67 @@
 
 ## Overview
 This service monitors processes by checking their status in a MySQL database and automatically restarts them when they enter an alarm state. Designed specifically for RedHat Linux environments, it provides robust process monitoring and management capabilities with circuit breaker pattern implementation to prevent cascading failures.
+> Database queries in `monitor_service.sh` were optimized by adding connection handling options to ensure quick closure after each query. Changes included `--connect-timeout=5`, `--quick`, `--compress`, and `--reconnect=FALSE` for both query functions. This prevents connection congestion from frequent queries.
+
+
+## Instalare
+
+### 1. Pregătirea sistemului
+
+```bash
+# Actualizarea sistemului
+sudo dnf update -y
+
+# Instalarea dependențelor necesare
+sudo dnf install -y mysql-server mysql-client
+```
+
+### 2. Configurarea directorului de serviciu
+
+```bash
+# Crearea directorului pentru serviciu
+sudo mkdir -p /opt/monitor_service
+
+# Copierea fișierelor necesare
+sudo cp monitor_service.sh /opt/monitor_service/
+sudo cp config.ini /opt/monitor_service/
+
+# Setarea permisiunilor
+sudo chmod 755 /opt/monitor_service
+sudo chmod 700 /opt/monitor_service/monitor_service.sh
+sudo chmod 600 /opt/monitor_service/config.ini
+```
+
+### 3. Configurarea MySQL
+
+```bash
+# Pornirea serviciului MySQL
+sudo systemctl enable mysqld
+sudo systemctl start mysqld
+
+# Rularea scriptului de configurare
+sudo mysql < setup.sql
+```
+
+### 4. Configurarea serviciului systemd
+
+```bash
+# Copierea fișierului de serviciu
+sudo cp monitor_service.service /etc/systemd/system/
+
+# Reîncărcarea daemon-ului systemd
+sudo systemctl daemon-reload
+
+# Activarea și pornirea serviciului
+sudo systemctl enable monitor_service
+sudo systemctl start monitor_service
+```
+#### Man page for service
+```bash
+sudo cp monitor_service.8 /usr/share/man/man8/
+sudo mandb
+man monitor_service
+```
 
 ```bash
 # Verifică drepturile de execuție
@@ -14,6 +75,15 @@ bash -x ./monitor_service.sh
 ```bash
 chmod 644 config.ini
 ```
+
+Probleme cu permisiunile:
+   ```bash
+   sudo chown -R root:root /opt/monitor_service
+   sudo chmod 700 /opt/monitor_service/monitor_service.sh
+   sudo chmod 600 /opt/monitor_service/config.ini
+   ```
+
+
 ## Core Functionality
 1. **Database Monitoring**
    - Continuously monitors MySQL database for processes in alarm state
@@ -38,11 +108,53 @@ chmod 644 config.ini
    - Automatic log rotation based on file size
    - Configurable number of log files to keep
 
-## Dependencies
-- MySQL Client (`mysql-client` package)
-- Bash 4.0 or higher (for associative arrays)
-- systemd (for service management)
-- Standard Linux utilities (`awk`, `date`, `pkill`)
+#### Custom restart command
+```ini
+# Config.ini
+[process.custom_example]
+restart_strategy = custom
+restart_command = /usr/local/bin/custom_restart.sh %s
+health_check_command = pgrep %s
+health_check_timeout = 10
+restart_delay = 3
+max_attempts = 2
+```
+
+```bash
+#.sh in case strategy
+           "custom")
+                # Get custom restart command
+                local restart_command=$(get_process_config "$process_name" "restart_command" "")
+
+                # Check if restart command is configured
+                if [ -z "$restart_command" ]; then
+                    log "ERROR" "RESTART LOG: No restart command configured for $process_name with custom strategy"
+                    return 1
+                fi
+
+                # Replace %s with process name if present in the command
+                restart_command=$(echo "$restart_command" | sed "s/%s/$process_name/g")
+
+                log "INFO" "RESTART LOG: Executing custom restart command for $process_name: $restart_command"
+
+                # Execute custom restart command
+                if eval "$restart_command" >/dev/null 2>&1; then
+                    log "INFO" "RESTART LOG: Custom restart command executed for: $process_name"
+                    # Perform health check after restart
+                    if perform_health_check "$process_name"; then
+                        log "INFO" "RESTART LOG: Successfully restarted and verified process: $process_name"
+                        return 0
+                    else
+                        log "ERROR" "RESTART LOG: Custom restart command succeeded but health check failed for: $process_name"
+                    fi
+                else
+                    log "ERROR" "RESTART LOG: Custom restart command failed for: $process_name"
+                fi
+                ;;
+
+
+```
+
 
 ## Configuration
 The service uses `config.ini` with the following sections:
@@ -64,11 +176,19 @@ max_log_size = 5120         # Maximum log file size in KB before rotation (5MB)
 log_files_to_keep = 5       # Number of rotated log files to keep
 
 [process.example]
-restart_strategy = service  # Strategy: service, process, or auto
+restart_strategy = service  # Strategy: service, process, auto, or custom
 pre_restart_command = /path/to/validation/script  # Command to run before restart
 health_check_command = systemctl is-active example  # Command to verify successful restart
 health_check_timeout = 10   # Maximum time in seconds to wait for health check to pass
 restart_delay = 5           # Delay between restart attempts
+max_attempts = 2            # Maximum number of restart attempts per cycle
+
+[process.custom_example]
+restart_strategy = custom   # Use custom restart command
+restart_command = /usr/local/bin/custom_restart.sh %s  # Custom command to restart the process
+health_check_command = pgrep %s  # Command to verify successful restart
+health_check_timeout = 10   # Maximum time in seconds to wait for health check to pass
+restart_delay = 3           # Delay between restart attempts
 max_attempts = 2            # Maximum number of restart attempts per cycle
 ```
 
@@ -151,53 +271,29 @@ CREATE TABLE PROCESE (
 ## Improvement Suggestions
 
 1. **Enhanced Security**
-   - Implement encrypted storage for database credentials
-   - Add support for MySQL SSL connections
    - Run service with minimal required permissions
 
 2. **Monitoring Enhancements**
-   - Add email/SMS notifications for critical failures
-   - Implement process resource monitoring (CPU, Memory)
    - Add process uptime tracking
    - Include process dependency management
 
-3. **System Integration**
-   - Add support for containerized processes
-   - Implement API endpoints for status monitoring
-   - Add support for clustering and high availability
-
-4. **Configuration Management**
-   - Add dynamic configuration reloading
-   - Support for YAML/JSON configuration formats
-   - Environment variable override support
-
 5. **Logging and Metrics**
-   - Add structured logging (JSON format)
    - Implement metrics collection for Prometheus
    - Add log rotation and archiving
    - Create dashboard templates for monitoring
 
 6. **Process Management**
-   - Add custom restart strategies per process
+   - Add custom restart strategies per process 
    - Implement graceful shutdown procedures
    - Support for process priority levels
    - Extend health check capabilities with HTTP/API endpoint checks
 
-7. **Circuit Breaker Enhancements**
-   - Add half-open state for circuit breaker
-   - Implement different circuit breaker strategies
-   - Add circuit breaker metrics and monitoring
-
 8. **Database Optimizations**
    - Add connection pooling
    - Implement retry mechanisms for database operations
-   - Add support for multiple database backends
 
 9. **Testing and Validation**
    - Add unit tests for core functions
-   - Create integration test suite
-   - Add automated deployment tests
-   - Implement chaos testing scenarios
 
 ## Troubleshooting
 
@@ -215,7 +311,3 @@ CREATE TABLE PROCESE (
    - Check process executable permissions
    - Verify service user permissions
    - Review systemd service configuration
-
-## Support
-
-For issues and feature requests, please check the improvement suggestions or create an issue in the repository.
